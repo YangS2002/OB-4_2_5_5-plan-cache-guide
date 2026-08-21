@@ -1,0 +1,417 @@
+# OceanBase Plan Cache 源码阅读计划
+
+## 目标
+
+建立 `ob plancache` 源码阅读路径，覆盖 SQL 文本模式、PS/PL 模式、通用 Lib Cache 抽象、命中/新增/淘汰/诊断链路。阅读完成后，应能回答：
+
+1. 一条 SQL 何时进入 plan cache，何时绕过。
+2. plan cache key 如何构造，哪些 session/schema/config 因素影响命中。
+3. `ObPlanCache` 如何查找、加锁、引用、返回 `ObPhysicalPlan`。
+4. 硬解析后计划如何加入 cache，重复/过期/内存超限如何处理。
+5. cache node、cache object、pcv set、plan set、ref handle 各自职责。
+6. PL/PS/TableAPI 等对象如何复用同一套 Lib Cache 框架。
+7. plan cache 统计、虚拟表、flush、淘汰如何实现。
+
+## 阅读边界
+
+### 核心目录
+
+- `src/sql/plan_cache/`
+- `src/sql/ob_sql.cpp`
+- `src/sql/ob_sql.h`
+- `src/sql/ob_sql_context.h`
+- `src/sql/engine/ob_physical_plan.h`
+- `src/sql/engine/ob_physical_plan_ctx.h`
+
+### PL 相关目录
+
+- `src/pl/pl_cache/`
+- `src/pl/ob_pl.cpp`
+- `src/pl/ob_pl_package_manager.cpp`
+
+### 观测与运维入口
+
+- `src/observer/virtual_table/ob_all_plan_cache_stat.cpp`
+- `src/observer/virtual_table/ob_plan_cache_plan_explain.cpp`
+- `src/observer/virtual_table/ob_gv_sql.cpp`
+- `src/observer/ob_rpc_processor_simple.cpp`
+- `src/share/inner_table/ob_inner_table_schema.*.cpp`
+
+### 测试入口
+
+- `unittest/sql/plan_cache/test_plan_cache.cpp`
+- `unittest/sql/plan_cache/test_plan_cache_value.cpp`
+- `unittest/sql/plan_cache/test_plan_cache.sql`
+- `tools/deploy/mysql_test/test_suite/plan_cache/`
+
+## 源码地图
+
+### 1. 顶层入口
+
+- `src/sql/ob_sql.cpp:4119`：`ObSql::execute_get_plan`，根据 `PC_TEXT_MODE` / `PC_PS_MODE` / `PC_PL_MODE` 调用不同 get plan 入口。
+- `src/sql/ob_sql.cpp:4186`：`ObSql::pc_get_plan`，封装 plan cache 命中流程、命中统计、权限复查。
+- `src/sql/ob_sql.cpp:4154`：`ObSql::pc_get_plan_and_fill_result`，命中后把 `ObPhysicalPlan` 填回 `ObResultSet`。
+- `src/sql/ob_sql.cpp:5072`：`ObSql::handle_physical_plan`，cache miss 后硬解析、生成物理计划、决定是否加入 cache。
+
+### 2. `ObPlanCache` 主类
+
+- `src/sql/plan_cache/ob_plan_cache.h:241`：生命周期、初始化、MTL tenant 级对象。
+- `src/sql/plan_cache/ob_plan_cache.h:267`：`add_plan`，新增物理计划。
+- `src/sql/plan_cache/ob_plan_cache.h:278`：`get_plan`，文本 SQL 查询计划。
+- `src/sql/plan_cache/ob_plan_cache.h:280`：`get_ps_plan`，PS/PL 查询计划。
+- `src/sql/plan_cache/ob_plan_cache.h:296`：内存配置接口。
+- `src/sql/plan_cache/ob_plan_cache.h:351`：淘汰入口。
+- `src/sql/plan_cache/ob_plan_cache.h:425`：flush 入口。
+- `src/sql/plan_cache/ob_plan_cache.cpp:537`：`ObPlanCache::get_plan` 具体流程。
+- `src/sql/plan_cache/ob_plan_cache.cpp:1022`：`ObPlanCache::add_plan` 具体流程。
+
+### 3. Key、Context、参数化
+
+- `src/sql/plan_cache/ob_plan_cache_struct.h:43`：`PlanCacheMode`。
+- `src/sql/plan_cache/ob_plan_cache_struct.h:52`：`ObPlanCacheKey`，包含 `name_`、`key_id_`、`db_id_`、`sessid_`、`mode_`、sys vars、config、弱读标记等。
+- `src/sql/plan_cache/ob_plan_cache_struct.h`：`ObPlanCacheCtx`、fast parser 结果、not-param 信息、重试判断。
+- `src/sql/plan_cache/ob_sql_parameterization.h/.cpp`：SQL 快速参数化。
+- `src/sql/plan_cache/ob_plan_cache.cpp:672`：`construct_fast_parser_result`，构造参数化 SQL 与 raw params。
+- `src/sql/plan_cache/ob_plan_cache.cpp:608`：`construct_multi_stmt_fast_parser_result`，batch multi statement 处理。
+
+### 4. Lib Cache 抽象层
+
+- `src/sql/plan_cache/ob_lib_cache_register.h:13`：namespace 注册表。
+  - `NS_CRSR`：SQL physical plan cache。
+  - `NS_PRCR` / `NS_SFC` / `NS_ANON` / `NS_TRGR` / `NS_PKG` / `NS_CALLSTMT`：PL cache。
+  - `NS_TABLEAPI`：TableAPI cache。
+  - `NS_SQLSTAT`：SQL stat cache。
+- `src/sql/plan_cache/ob_i_lib_cache_key.h`：通用 key 接口。
+- `src/sql/plan_cache/ob_i_lib_cache_node.h/.cpp`：通用 node 接口、锁、引用、对象集合。
+- `src/sql/plan_cache/ob_i_lib_cache_object.h/.cpp`：通用 cache object 接口。
+- `src/sql/plan_cache/ob_lib_cache_key_creator.*`：按 namespace 创建 key。
+- `src/sql/plan_cache/ob_lib_cache_node_factory.*`：按 namespace 创建 node。
+- `src/sql/plan_cache/ob_cache_object_factory.*`：按 namespace 创建 object。
+- `src/sql/plan_cache/ob_lib_cache_object_manager.*`：cache object ID 管理、引用、释放、统计。
+
+### 5. SQL 计划容器层
+
+- `src/sql/plan_cache/ob_pcv_set.h/.cpp`：同一 plan cache key 下的 value set；负责多版本/约束匹配。
+- `src/sql/plan_cache/ob_plan_cache_value.h/.cpp`：按 sys vars、db、not params 等进一步区分 cache value。
+- `src/sql/plan_cache/ob_plan_set.h/.cpp`：管理同一 value 下多个 `ObPhysicalPlan`，处理 plan 选择。
+- `src/sql/plan_cache/ob_plan_match_helper.h/.cpp`：plan 匹配辅助。
+- `src/sql/plan_cache/ob_dist_plans.h/.cpp`：分布式计划相关。
+- `src/sql/plan_cache/ob_cache_object.h/.cpp`：`ObPhysicalPlan` 继承/复用的 cache object 基础信息。
+
+### 6. 引用计数与安全访问
+
+- `src/sql/plan_cache/ob_pc_ref_handle.h/.cpp`：引用 handle 定义和诊断。
+- `src/sql/plan_cache/ob_plan_cache_callback.h/.cpp`：callback 逻辑。
+- 重点理解：
+  - 命中计划前后如何 `inc_ref_count` / `dec_ref_count`。
+  - `ObCacheObjGuard` 如何保证异常路径释放。
+  - 虚拟表遍历前为何需要 `ObReqTimeGuard`。
+
+### 7. 内存、淘汰、flush
+
+- `src/sql/plan_cache/ob_plan_cache_util.h/.cpp`：内存百分比配置、统计结构、GC 配置。
+- `src/sql/plan_cache/ob_plan_cache.h:298`：`get_mem_limit`。
+- `src/sql/plan_cache/ob_plan_cache.h:309`：`get_mem_high`。
+- `src/sql/plan_cache/ob_plan_cache.h:310`：`get_mem_low`。
+- `src/sql/plan_cache/ob_plan_cache.cpp:1022`：add 前检查内存上限。
+- `src/sql/plan_cache/ob_plan_cache.cpp`：搜索 `cache_evict`、`flush_plan_cache`、`flush_lib_cache_by_ns`。
+- `src/observer/ob_rpc_processor_simple.cpp:1194` 起：RPC flush plan cache / lib cache / PL cache 入口。
+
+### 8. PL Cache 复用链路
+
+- `src/pl/pl_cache/ob_pl_cache.h:212`：`ObPLObjectKey`。
+- `src/pl/pl_cache/ob_pl_cache_object.h`：PL function/package cache object。
+- `src/pl/pl_cache/ob_pl_cache_mgr.h/.cpp`：PL cache get/add 管理。
+- `src/pl/pl_cache/ob_pl_cache.cpp`：PL object set 匹配与新增。
+- `src/pl/ob_pl.cpp:2564` 起：匿名 routine 从 plan cache 获取或编译。
+- `src/pl/ob_pl.cpp:2822` 起：PL function 加入 plan cache。
+- `src/pl/ob_pl_package_manager.cpp:1688`：package 加入 plan cache。
+- `src/pl/ob_pl_package_manager.cpp:1749`：package 从 plan cache 获取。
+
+## 建议阅读顺序
+
+### 阶段 0：先跑通概念
+
+1. 读 `src/sql/plan_cache/ob_lib_cache_register.h`。
+2. 画 namespace 表：`NS_CRSR`、PL、TableAPI、SQLSTAT。
+3. 记录每个 namespace 对应 key、node、object 类型。
+
+产出：一张「namespace -> key/node/object」表。
+
+### 阶段 1：SQL 命中主链路
+
+调用栈：
+
+```text
+ObSql::pc_get_plan
+  -> ObSql::execute_get_plan
+    -> ObPlanCache::get_plan
+      -> construct_fast_parser_result
+      -> get_plan_cache
+        -> get_cache_obj
+        -> check_after_get_plan
+  -> pc_get_plan_and_fill_result
+```
+
+重点问题：
+
+- SQL 原文在哪里进入 `ObPlanCacheCtx`。
+- fast parser 如何生成 `pc_key_.name_` 与 `raw_params_`。
+- exact mode 如何影响 key。
+- 命中后如何设置 `context.plan_cache_hit_`。
+- 命中后还会做哪些权限/只读检查。
+
+产出：一张「cache hit 时序图」。
+
+### 阶段 2：SQL miss 与 add plan 链路
+
+调用栈：
+
+```text
+ObSql::handle_physical_plan
+  -> handle_parser
+  -> generate_sql_id
+  -> get_outline_data
+  -> generate_physical_plan
+  -> need_add_plan
+  -> pc_add_plan / pc_add_spm_plan
+    -> ObPlanCache::add_plan
+      -> construct_plan_cache_key
+      -> add_plan_cache
+        -> add_cache_obj
+```
+
+重点问题：
+
+- 哪些场景 `add_plan_to_pc = false`。
+- plan 过大、内存超限、重复计划、lock conflict 如何处理。
+- add plan 失败是否影响 SQL 执行主链路。
+- old schema version 如何 retry。
+
+产出：一张「hard parse -> add plan」流程图。
+
+### 阶段 3：Key 和匹配规则
+
+阅读文件：
+
+- `ob_plan_cache_struct.h`
+- `ob_sql_parameterization.*`
+- `ob_plan_match_helper.*`
+- `ob_pcv_set.*`
+- `ob_plan_cache_value.*`
+- `ob_plan_set.*`
+
+重点问题：
+
+- `ObPlanCacheKey::hash` 和 `is_equal` 涉及哪些字段。
+- `not_param_index_`、`neg_param_index_` 用途。
+- sys vars、config、db id、weak read 如何参与命中。
+- 多个 candidate plan 如何筛选。
+- schema version、table location、约束如何校验。
+
+产出：一张「key 粗筛 -> value 精筛 -> plan 选择」结构图。
+
+### 阶段 4：Lib Cache 通用框架
+
+阅读文件：
+
+- `ob_i_lib_cache_key.*`
+- `ob_i_lib_cache_node.*`
+- `ob_i_lib_cache_object.*`
+- `ob_lib_cache_key_creator.*`
+- `ob_lib_cache_node_factory.*`
+- `ob_cache_object_factory.*`
+- `ob_lib_cache_object_manager.*`
+
+重点问题：
+
+- `cache_key_node_map_` 存什么。
+- node 与 object 生命周期如何分离。
+- lock/ref handle 如何配合。
+- `create_node_and_add_cache_obj` 与已有 node add 有何不同。
+- object manager 如何按 ID ref plan。
+
+产出：一张「key map / node / object manager」对象关系图。
+
+### 阶段 5：内存与淘汰
+
+阅读文件：
+
+- `ob_plan_cache_util.*`
+- `ob_plan_cache.cpp` 中 `cache_evict*`、`calc_evict_num`、`flush*`。
+- `ob_pc_ref_handle.*`
+
+重点问题：
+
+- `mem_used`、`mem_hold`、label hold 差异。
+- `ob_plan_cache_percentage`、high/low percentage 如何生效。
+- 后台淘汰和手动 flush 入口差异。
+- 正在被引用对象如何避免释放。
+- deleted object dump 如何工作。
+
+产出：一张「内存水位 -> 淘汰 -> 延迟释放」流程图。
+
+### 阶段 6：PS 与 PL
+
+PS：
+
+- `ob_ps_cache.*`
+- `ob_prepare_stmt_struct.*`
+- `ObSql::handle_ps_prepare`
+- `ObSql::handle_ps_execute`
+- `ObPlanCache::get_ps_plan`
+- `ObPlanCache::add_ps_plan`
+
+PL：
+
+- `src/pl/pl_cache/`
+- `src/pl/ob_pl.cpp`
+- `src/pl/ob_pl_package_manager.cpp`
+
+重点问题：
+
+- PS 的 `stmt_id` 如何进入 key。
+- PL function/package key 如何构造。
+- PL object 与 SQL physical plan 共用哪些基础设施。
+- PL 编译失败/加 cache 失败是否影响执行。
+
+产出：一张「SQL/PS/PL 三种模式对比表」。
+
+### 阶段 7：观测与运维
+
+阅读文件：
+
+- `ob_all_plan_cache_stat.cpp`
+- `ob_plan_cache_plan_explain.cpp`
+- `ob_gv_sql.cpp`
+- `ob_all_virtual_sql_plan.cpp`
+- `ob_virtual_sql_plan_statistics.cpp`
+- `ob_rpc_processor_simple.cpp`
+
+重点问题：
+
+- `GV$OB_PLAN_CACHE_STAT` 数据从哪里来。
+- `GV$OB_PLAN_CACHE_PLAN_EXPLAIN` 如何 ref plan 并展示 explain。
+- `GV$SQL` 如何遍历 cache object。
+- flush plan cache 与 flush lib cache 语义差异。
+- fine-grained evict by sql_id/schema_id/db_id 如何实现。
+
+产出：一张「虚拟表/运维命令 -> PlanCache API」映射表。
+
+### 阶段 8：测试与验证
+
+阅读并运行或静态分析：
+
+- `unittest/sql/plan_cache/test_plan_cache.cpp`
+- `unittest/sql/plan_cache/test_plan_cache_value.cpp`
+- `unittest/sql/plan_cache/test_plan_cache.sql`
+- `tools/deploy/mysql_test/test_suite/plan_cache/t/*.test`
+
+重点问题：
+
+- 单测覆盖哪些 key/match/add/evict 场景。
+- 哪些边界没覆盖。
+- 如何构造一个最小 SQL 命中/miss 实验。
+
+产出：一份「可复现实验清单」。
+
+## 建议笔记模板
+
+```text
+函数：
+位置：
+调用方：
+被调方：
+输入关键字段：
+输出/副作用：
+错误码处理：
+锁/引用计数：
+内存影响：
+未理解点：
+```
+
+```text
+结构体/类：
+位置：
+职责：
+生命周期归属：
+关键字段：
+与其他对象关系：
+并发保护方式：
+```
+
+## 推荐绘图清单
+
+1. SQL text cache hit 时序图。
+2. hard parse 后 add plan 时序图。
+3. `ObPlanCacheKey -> ObILibCacheNode -> ObPCVSet -> ObPlanCacheValue -> ObPlanSet -> ObPhysicalPlan` 对象关系图。
+4. ref handle 生命周期图。
+5. mem high/low 水位淘汰图。
+6. SQL / PS / PL / TableAPI 共用 Lib Cache 对比图。
+7. 虚拟表与 PlanCache API 映射图。
+
+## 关键断点建议
+
+- `ObSql::pc_get_plan`
+- `ObSql::execute_get_plan`
+- `ObPlanCache::get_plan`
+- `ObPlanCache::construct_fast_parser_result`
+- `ObPlanCache::get_plan_cache`
+- `ObPlanCache::get_cache_obj`
+- `ObSql::handle_physical_plan`
+- `ObSql::pc_add_plan`
+- `ObPlanCache::add_plan`
+- `ObPlanCache::add_cache_obj`
+- `ObILibCacheNode::add_cache_obj`
+- `ObPCVSet::get_cache_obj`
+- `ObPlanCacheValue::get_plan`
+- `ObPlanSet::get_plan`
+
+## 阅读完成验收问题
+
+1. 同一 SQL 改变 `sql_mode`、collation、weak read、database 后是否还能命中？为什么？
+2. fast parser 参数化失败时会怎样？
+3. exact mode 下 key 有何不同？
+4. plan cache 命中后为什么还要做权限/只读检查？
+5. add plan 失败为何通常不影响 SQL 执行？
+6. `mem_used` 与 `mem_hold` 差异是什么？
+7. `ObCacheObjGuard` 解决了什么生命周期问题？
+8. flush plan cache、flush PL cache、flush lib cache 差别是什么？
+9. PL package cache 和 SQL physical plan cache 共用了哪些机制？
+10. 虚拟表遍历 plan cache 时如何避免对象被释放？
+
+## 建议时间安排
+
+### 第 1 天
+
+- 阶段 0、1。
+- 目标：跑通 text SQL cache hit 主链路。
+
+### 第 2 天
+
+- 阶段 2、3。
+- 目标：理解 miss、hard parse、add plan、key/match 规则。
+
+### 第 3 天
+
+- 阶段 4、5。
+- 目标：理解 Lib Cache 框架、引用计数、内存淘汰。
+
+### 第 4 天
+
+- 阶段 6。
+- 目标：对比 SQL/PS/PL cache 复用方式。
+
+### 第 5 天
+
+- 阶段 7、8。
+- 目标：掌握观测接口、flush/evict、测试验证。
+
+## 最终产出
+
+1. 一份对象关系图。
+2. 三条主链路时序图：hit、miss/add、evict/flush。
+3. 一张 SQL/PS/PL/TableAPI 对比表。
+4. 一张虚拟表/运维入口映射表。
+5. 一份最小实验 SQL 与预期命中/未命中结果。
+6. 一份未理解问题清单，按模块归档。
